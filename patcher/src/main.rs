@@ -1,37 +1,53 @@
 use std::{env, fs, thread};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
 use std::time::Duration;
-use jack::{
-    Client, ClientOptions, Control, NotificationHandler,
-    Port, PortFlags, PortId, PortSpec
-};
+
+use ctrlc;
+use jack::{Client, ClientOptions, Control, NotificationHandler, Port, PortId, PortSpec};
+
+#[repr(u8)]
+pub enum Action {
+    None = 0,
+    Repatch = 1,
+    Stop = 2,
+}
+
+impl Into<Action> for u8 {
+    fn into(self) -> Action {
+        match self {
+            1 => Action::Repatch,
+            2 => Action::Stop,
+            _ => Action::None,
+        }
+    }
+}
 
 struct PortHandler {
-    state: Arc<AtomicBool>
+    state: Arc<AtomicU8>
 }
 
 impl PortHandler {
-    fn new(s: &Arc<AtomicBool>) -> PortHandler {
+    fn new(s: &Arc<AtomicU8>) -> PortHandler {
         PortHandler { state: s.clone() }
     }
 }
 
 impl NotificationHandler for PortHandler {
     fn client_registration(&mut self, _c: &Client, _p: &str, is_reg: bool) {
-        if is_reg { self.state.store(true, Ordering::Relaxed) };
+        if is_reg { self.state.store(Action::Repatch as u8, Ordering::Relaxed) };
     }
 
     fn port_registration(&mut self, _c: &Client, _p: PortId, is_reg: bool) {
-        if is_reg { self.state.store(true, Ordering::Relaxed) };
+        if is_reg { self.state.store(Action::Repatch as u8, Ordering::Relaxed) };
     }
 
     fn port_rename(&mut self, _c: &Client, _p: PortId, _o: &str, _n: &str) -> Control {
-        self.state.store(true, Ordering::Relaxed);
+        self.state.store(Action::Repatch as u8, Ordering::Relaxed);
         Control::Continue
     }
 
     fn ports_connected(&mut self, _c: &Client, _a: PortId, _b: PortId, _: bool) {
-        self.state.store(true, Ordering::Relaxed);
+        self.state.store(Action::Repatch as u8, Ordering::Relaxed);
     }
 }
 
@@ -108,7 +124,6 @@ fn check_connection<PS: PortSpec>(c: &Client, out: &Port<PS>, inp: &Port<PS>, co
 }
 
 fn check_ports(c: &Client, conns: &Vec<Conn>) {
-    println!("Looks like we got a callback");
     for conn in conns {
         if let (Some(out), Some(inp)) = (c.port_by_name(&conn.out), c.port_by_name(&conn.inp)) {
             match check_connection(c, &out, &inp, &conn) {
@@ -117,6 +132,14 @@ fn check_ports(c: &Client, conns: &Vec<Conn>) {
             }
         }
     }
+}
+
+fn set_quit_handler(s: &Arc<AtomicU8>) {
+    let s = s.clone();
+    ctrlc::set_handler(move || { 
+        println!("Patcher is shutting down");
+        s.store(Action::Stop as u8, Ordering::Relaxed);
+    }).expect("Unable to create signal handler");
 }
 
 fn main() {
@@ -130,21 +153,28 @@ fn main() {
         }
     }
 
-    for c in &conns { println!("{}, {}", c.out, c.inp) }
+    println!("Connection list:");
+    for c in &conns { println!("\t{}, {}", c.out, c.inp) }
 
-    let state = Arc::new(false.into());
+    let state = Arc::new((Action::Repatch as u8).into());
     let (client, _) = Client::new("patcher", ClientOptions::NO_START_SERVER)
         .expect("Cannot create JACK client");
     let handler = PortHandler::new(&state);
     let client = client.activate_async(handler, ()).expect("Unable to activate client");
-    println!("Patcher is now active");
 
-    for p in client.as_client().ports(None, None, PortFlags::empty()) {
-        println!("{}", p)
-    }
-
+    set_quit_handler(&state);
     loop {
-        if state.load(Ordering::Relaxed) { check_ports(client.as_client(), &conns); }
+        match state.load(Ordering::Relaxed).into() {
+            Action::None => (),
+            Action::Repatch => {
+                check_ports(&client.as_client(), &conns);
+                state.store(Action::None as u8, Ordering::Relaxed);
+            },
+            Action::Stop => break,
+        }
         thread::sleep(Duration::from_millis(200));
+    }
+    if let Err(e) = &client.deactivate() { 
+        eprintln!("Error deactivating client: {}", e);
     }
 }
